@@ -17,7 +17,7 @@ else()
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/target)
 endif()
 
-find_package(FFMPEG REQUIRED COMPONENTS avcodec)
+find_package(FFMPEG REQUIRED COMPONENTS avcodec avformat avutil avfilter swresample swscale)
 
 if(FFMPEG_FOUND)
     message("---------------- found FFMPEG")
