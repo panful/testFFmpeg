@@ -34,3 +34,5 @@ add_executable(${target_name} main.cpp)
 
 target_include_directories(${target_name} PRIVATE ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(${target_name} PRIVATE ${FFMPEG_LIBRARIES})
+
+target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external) # stb_image

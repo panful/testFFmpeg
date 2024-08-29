@@ -2,6 +2,7 @@
  * 1. 测试 FFMPEG 环境
  * 2. 输出 FFMPEG 的版本
  * 3. 查看视频流信息
+ * 4. 视频流解码，保存指定帧为图片
  */
 
 #define TEST4
@@ -130,6 +131,9 @@ extern "C" {
 }
 #endif
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
 #include <iostream>
 
 int main()
@@ -142,6 +146,10 @@ int main()
     AVCodec* codec                 = NULL; // 解码器
     AVPacket* pkt                  = NULL; // 解码前的数据，包
     AVFrame* frame                 = NULL; // 解码后的数据，帧
+
+    // 用来将YUV转换为RGB
+    AVFrame* rgbFrame = NULL;
+    AVFrame* yuvFrame = NULL;
 
     int ret;
     do
@@ -217,6 +225,30 @@ int main()
         pkt   = av_packet_alloc();
         frame = av_frame_alloc();
 
+        yuvFrame = frame;
+        rgbFrame = av_frame_alloc();
+
+        //----------------- 设置数据转换参数 -------------------
+        struct SwsContext* img_ctx = sws_getContext(
+            codecCtx->width,
+            codecCtx->height,
+            codecCtx->pix_fmt, // 源地址长宽以及数据格式
+            codecCtx->width,
+            codecCtx->height,
+            AV_PIX_FMT_RGB24,  // 目的地址长宽以及数据格式
+            SWS_BICUBIC,
+            NULL,
+            NULL,
+            NULL
+        );
+
+        // 一帧图像数据大小，会根据图像格式、图像宽高计算所需内存字节大小
+        int numBytes              = av_image_get_buffer_size(AV_PIX_FMT_RGB24, codecCtx->width, codecCtx->height, 1);
+        unsigned char* out_buffer = (unsigned char*)av_malloc(numBytes * sizeof(unsigned char));
+
+        // 将rgbFrame中的数据以RGB格式存放在out_buffer中
+        av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, out_buffer, AV_PIX_FMT_RGB24, codecCtx->width, codecCtx->height, 1);
+
         //----------------- 读取视频帧 -------------------
         int i = 0;                              // 记录视频帧数
         while (av_read_frame(fmtCtx, pkt) >= 0) // 读取的是一帧视频  数据存入AVPacket结构体中
@@ -237,11 +269,31 @@ int main()
                         // 可以通过openCV、openGL、SDL方式进行显示
                         // 也可以保存到文件中（需要添加文件头）
                         i++;
+
+                        // 将视频的第100帧数据保存为图片
+                        if (i == 100)
+                        {
+                            // mp4文件中视频流使用的是h.264，帧图像为yuv420格式
+                            // 通过sws_scale将数据转换为RGB格式
+                            sws_scale(
+                                img_ctx,
+                                (const uint8_t* const*)yuvFrame->data,
+                                yuvFrame->linesize,
+                                0,
+                                codecCtx->height,
+                                rgbFrame->data,
+                                rgbFrame->linesize
+                            );
+
+                            stbi_write_jpg("test.jpg", codecCtx->width, codecCtx->height, 3, out_buffer, 100);
+                        }
                     }
                 }
             }
             av_packet_unref(pkt); // 重置pkt的内容
         }
+
+        av_free(out_buffer);
 
         // 此时缓存区中还存在数据，需要发送空包刷新
         ret = avcodec_send_packet(codecCtx, NULL);
@@ -261,6 +313,8 @@ int main()
     avformat_close_input(&fmtCtx);
     av_packet_free(&pkt);
     av_frame_free(&frame);
+
+    av_frame_free(&rgbFrame);
 
     return 0;
 }
