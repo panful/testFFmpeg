@@ -1,10 +1,10 @@
 /**
  * 1. 测试 FFMPEG 环境
  * 2. 输出 FFMPEG 的版本
- *
+ * 3. 查看视频流信息
  */
 
-#define TEST2
+#define TEST3
 
 #ifdef TEST1
 
@@ -73,3 +73,44 @@ int main()
 }
 
 #endif // TEST2
+
+#ifdef TEST3
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavformat/avformat.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#include <iostream>
+
+int main()
+{
+    AVFormatContext* fmt_ctx = avformat_alloc_context(); // 创建对象并初始化
+    const char* filePath     = "../resources/test.mp4";
+
+    // 打开文件
+    if (auto result = avformat_open_input(&fmt_ctx, filePath, NULL, NULL); result < 0)
+    {
+        std::cout << "Cannot open video file";
+        return -1;
+    }
+
+    // 查找流信息（音频流和视频流）
+    if (auto result = avformat_find_stream_info(fmt_ctx, NULL); result < 0)
+    {
+        std::cout <<"Cannot find stream information\n";
+        return -1;
+    }
+
+    av_dump_format(fmt_ctx, 0, filePath, 0); // 输出视频信息
+    avformat_close_input(&fmt_ctx);          // 关闭文件
+
+    return 0;
+}
+
+#endif // TEST3
