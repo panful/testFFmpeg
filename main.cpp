@@ -4,7 +4,7 @@
  * 3. 查看视频流信息
  */
 
-#define TEST3
+#define TEST4
 
 #ifdef TEST1
 
@@ -103,7 +103,7 @@ int main()
     // 查找流信息（音频流和视频流）
     if (auto result = avformat_find_stream_info(fmt_ctx, NULL); result < 0)
     {
-        std::cout <<"Cannot find stream information\n";
+        std::cout << "Cannot find stream information\n";
         return -1;
     }
 
@@ -114,3 +114,155 @@ int main()
 }
 
 #endif // TEST3
+
+#ifdef TEST4
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#include <iostream>
+
+int main()
+{
+    const char* filePath = "../resources/test.mp4";
+
+    AVFormatContext* fmtCtx        = NULL;
+    AVCodecContext* codecCtx       = NULL;
+    AVCodecParameters* avCodecPara = NULL;
+    AVCodec* codec                 = NULL; // 解码器
+    AVPacket* pkt                  = NULL; // 解码前的数据，包
+    AVFrame* frame                 = NULL; // 解码后的数据，帧
+
+    int ret;
+    do
+    {
+        //----------------- 创建AVFormatContext结构体 -------------------
+        // 内部存放着描述媒体文件或媒体流的构成和基本信息
+        fmtCtx = avformat_alloc_context();
+
+        //----------------- 打开本地文件 -------------------
+        ret = avformat_open_input(&fmtCtx, filePath, NULL, NULL);
+        if (ret)
+        {
+            printf("cannot open file\n");
+            break;
+        }
+
+        //----------------- 获取多媒体文件信息 -------------------
+        ret = avformat_find_stream_info(fmtCtx, NULL);
+        if (ret < 0)
+        {
+            printf("Cannot find stream information\n");
+            break;
+        }
+
+        // 通过循环查找多媒体文件中包含的流信息，直到找到视频类型的流，并记录该索引值
+        int videoIndex = -1;
+        for (unsigned int i = 0; i < fmtCtx->nb_streams; i++)
+        {
+            if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
+                videoIndex = i;
+                break;
+            }
+        }
+
+        // 如果videoIndex为-1 说明没有找到视频流
+        if (videoIndex == -1)
+        {
+            printf("cannot find video stream\n");
+            break;
+        }
+
+        // 打印流信息
+        // av_dump_format(fmtCtx, 0, filePath, 0);
+
+        //----------------- 查找解码器 -------------------
+        avCodecPara          = fmtCtx->streams[videoIndex]->codecpar;
+        const AVCodec* codec = avcodec_find_decoder(avCodecPara->codec_id);
+        if (codec == NULL)
+        {
+            printf("cannot open decoder\n");
+            break;
+        }
+
+        // 根据解码器参数来创建解码器上下文
+        codecCtx = avcodec_alloc_context3(codec);
+        ret      = avcodec_parameters_to_context(codecCtx, avCodecPara);
+        if (ret < 0)
+        {
+            printf("parameters to context fail\n");
+            break;
+        }
+
+        //----------------- 打开解码器 -------------------
+        ret = avcodec_open2(codecCtx, codec, NULL);
+        if (ret < 0)
+        {
+            printf("cannot open decoder\n");
+            break;
+        }
+
+        //----------------- 创建AVPacket和AVFrame结构体 -------------------
+        pkt   = av_packet_alloc();
+        frame = av_frame_alloc();
+
+        //----------------- 读取视频帧 -------------------
+        int i = 0;                              // 记录视频帧数
+        while (av_read_frame(fmtCtx, pkt) >= 0) // 读取的是一帧视频  数据存入AVPacket结构体中
+        {
+            // 是否对应视频流的帧
+            if (pkt->stream_index == videoIndex)
+            {
+                // 发送包数据去进行解析获得帧数据
+                ret = avcodec_send_packet(codecCtx, pkt);
+                if (ret == 0)
+                {
+                    // 接收的帧不一定只有一个，可能为0个或多个
+                    // 比如：h264中存在B帧，会参考前帧和后帧数据得出图像数据
+                    // 即读到B帧时不会产出对应数据，直到后一个有效帧读取时才会有数据，此时就有2帧
+                    while (avcodec_receive_frame(codecCtx, frame) == 0)
+                    {
+                        // 此处就可以获取到视频帧中的图像数据 -> frame.data
+                        // 可以通过openCV、openGL、SDL方式进行显示
+                        // 也可以保存到文件中（需要添加文件头）
+                        i++;
+                    }
+                }
+            }
+            av_packet_unref(pkt); // 重置pkt的内容
+        }
+
+        // 此时缓存区中还存在数据，需要发送空包刷新
+        ret = avcodec_send_packet(codecCtx, NULL);
+        if (ret == 0)
+        {
+            while (avcodec_receive_frame(codecCtx, frame) == 0)
+            {
+                i++;
+            }
+        }
+
+        printf("There are %d frames int total.\n", i);
+    } while (0);
+
+    //----------------- 释放所有指针 -------------------
+    avcodec_free_context(&codecCtx); // avcodec_close 被声明为已否决
+    avformat_close_input(&fmtCtx);
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+
+    return 0;
+}
+
+#endif // TEST4
