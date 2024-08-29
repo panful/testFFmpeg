@@ -3,9 +3,10 @@
  * 2. 输出 FFMPEG 的版本
  * 3. 查看视频流信息
  * 4. 视频流解码，保存指定帧为图片
+ * 5. 多个图片保存为 mp4(mkv flv avi) 文件
  */
 
-#define TEST4
+#define TEST5
 
 #ifdef TEST1
 
@@ -320,3 +321,279 @@ int main()
 }
 
 #endif // TEST4
+
+#ifdef TEST5
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#include <array>
+#include <iostream>
+#include <map>
+
+int rgb2mp4Encode(AVCodecContext* codecCtx, AVFrame* yuvFrame, AVPacket* pkt, AVStream* vStream, AVFormatContext* fmtCtx)
+{
+    int ret = 0;
+
+    // 解码时为 avcodec_send_packet ，编码时为 avcodec_send_frame
+    if (avcodec_send_frame(codecCtx, yuvFrame) >= 0)
+    {
+        // 解码时为 avcodec_receive_frame ，编码时为 avcodec_receive_packet
+        while (avcodec_receive_packet(codecCtx, pkt) >= 0)
+        {
+            pkt->stream_index = vStream->index;
+            pkt->pos          = -1;                                             // pos为-1表示未知，编码器编码时进行设置
+
+            av_packet_rescale_ts(pkt, codecCtx->time_base, vStream->time_base); // 将解码上下文中的时间基同等转换为流中的时间基
+            std::cout << "encoder success:" << pkt->size << std::endl;
+
+            // 将包数据写入文件中
+            ret = av_interleaved_write_frame(fmtCtx, pkt);
+            if (ret < 0)
+            {
+                char errStr[256];
+                av_strerror(ret, errStr, 256);
+                std::cout << "error is:" << errStr << std::endl;
+            }
+        }
+    }
+
+    return ret;
+}
+
+void rgb2mp4(const char* filePath = "output.mp4")
+{
+    int ret;
+    AVFormatContext* fmtCtx  = NULL;
+    AVCodecContext* codecCtx = NULL;
+    const AVCodec* codec     = NULL;
+    AVStream* vStream        = NULL;
+    AVPacket* pkt            = av_packet_alloc();
+
+    AVFrame *rgbFrame = NULL, *yuvFrame = NULL;
+
+    // 需要编码的视频宽高、每幅图像所占帧数
+    int w = 600, h = 900, perFrameCnt = 25;
+
+    do
+    {
+        //----------------- 打开输出文件 -------------------
+        // 创建输出结构上下文 AVFormatContext,会根据文件后缀创建相应的初始化参数
+        ret = avformat_alloc_output_context2(&fmtCtx, NULL, NULL, filePath);
+        if (ret < 0)
+        {
+            std::cout << "Cannot alloc output file context" << std::endl;
+            break;
+        }
+
+        ret = avio_open(&fmtCtx->pb, filePath, AVIO_FLAG_READ_WRITE);
+        if (ret < 0)
+        {
+            std::cout << "output file open failed" << std::endl;
+            break;
+        }
+
+        //----------------- 查找编码器 -------------------
+        // 查找codec有三种方法
+
+        // 1.AVFormatContext的oformat中存放了对应的编码器类型
+        // AVOutputFormat* outFmt = fmtCtx->oformat;
+        // codec = avcodec_find_encoder(outFmt->video_codec);
+
+        // 2.根据编码器名称去查找
+        // codec = avcodec_find_encoder_by_name("libx264");
+
+        // 3.根据编码器ID查找
+        codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+
+        if (codec == NULL)
+        {
+            std::cout << "Cannot find any endcoder" << std::endl;
+            break;
+        }
+
+        //----------------- 申请编码器上下文结构体 -------------------
+        codecCtx = avcodec_alloc_context3(codec);
+        if (codecCtx == NULL)
+        {
+            std::cout << "Cannot alloc AVCodecContext" << std::endl;
+            break;
+        }
+
+        //----------------- 创建视频流，并设置参数 -------------------
+        vStream = avformat_new_stream(fmtCtx, codec);
+        if (vStream == NULL)
+        {
+            std::cout << "failed create new video stream" << std::endl;
+            break;
+        }
+
+        // 设置时间基，25为分母，1为分子，表示以1/25秒时间间隔播放一帧图像
+        vStream->time_base = AVRational {1, 25}; // den = 25 num =1
+
+        // 设置编码所需的参数
+        AVCodecParameters* param = vStream->codecpar;
+        param->width             = w;
+        param->height            = h;
+        param->codec_type        = AVMEDIA_TYPE_VIDEO;
+
+        //----------------- 将参数传给解码器上下文 -------------------
+        ret = avcodec_parameters_to_context(codecCtx, param);
+        if (ret < 0)
+        {
+            std::cout << "Cannot copy codec para" << std::endl;
+            break;
+        }
+
+        codecCtx->pix_fmt   = AV_PIX_FMT_YUV420P;
+        codecCtx->time_base = AVRational {1, 25};
+        codecCtx->bit_rate  = 400000;
+        codecCtx->gop_size  = 12; // gop表示多少个帧中存在一个关键帧
+
+        // 某些封装格式必须要设置该标志，否则会造成封装后文件中信息的缺失,如：mp4
+        if (fmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
+        {
+            codecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        // H264-设置量化步长范围
+        if (codec->id == AV_CODEC_ID_H264)
+        {
+            codecCtx->qmin      = 10;
+            codecCtx->qmax      = 51;
+            codecCtx->qcompress = (float)0.6; // (0~1.0),0=>CBR 1->恒定QP
+        }
+
+        //----------------- 打开解码器 -------------------
+        ret = avcodec_open2(codecCtx, codec, NULL);
+        if (ret < 0)
+        {
+            std::cout << "Open encoder failed" << std::endl;
+            break;
+        }
+
+        // 再将codecCtx设置的参数传给param，用于写入头文件信息
+        avcodec_parameters_from_context(param, codecCtx);
+
+        // 设置视频帧参数
+        rgbFrame         = av_frame_alloc();
+        yuvFrame         = av_frame_alloc();
+        yuvFrame->width  = w;
+        yuvFrame->height = h;
+        yuvFrame->format = codecCtx->pix_fmt;
+        rgbFrame->width  = w;
+        rgbFrame->height = h;
+        rgbFrame->format = AV_PIX_FMT_BGR24;
+
+        int size        = av_image_get_buffer_size((AVPixelFormat)rgbFrame->format, w, h, 1);
+        uint8_t* buffer = (uint8_t*)av_malloc(size);
+        ret             = av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, buffer, (AVPixelFormat)rgbFrame->format, w, h, 1);
+        if (ret < 0)
+        {
+            std::cout << "Cannot filled rgbFrame" << std::endl;
+            break;
+        }
+
+        // int yuvSize        = av_image_get_buffer_size((AVPixelFormat)yuvFrame->format, w, h, 1);
+        uint8_t* yuvBuffer = (uint8_t*)av_malloc(size);
+        ret                = av_image_fill_arrays(yuvFrame->data, yuvFrame->linesize, yuvBuffer, (AVPixelFormat)yuvFrame->format, w, h, 1);
+        if (ret < 0)
+        {
+            std::cout << "Cannot filled yuvFrame" << std::endl;
+            break;
+        }
+
+        // 设置BGR数据转换为YUV的SwsContext
+        SwsContext* imgCtx = sws_getContext(w, h, AV_PIX_FMT_BGR24, w, h, codecCtx->pix_fmt, 0, NULL, NULL, NULL);
+
+        // 写入文件头信息
+        ret = avformat_write_header(fmtCtx, NULL);
+        if (ret != AVSTREAM_INIT_IN_WRITE_HEADER)
+        {
+            std::cout << "Write file header fail" << std::endl;
+            break;
+        }
+
+        av_new_packet(pkt, size);
+
+        // 自定义6个图片数据
+        std::map<int, std::array<uint8_t, 3>> test_images {
+            {0, {255, 0, 0}  },
+            {1, {0, 255, 0}  },
+            {2, {0, 0, 255}  },
+            {3, {255, 255, 0}},
+            {4, {0, 255, 255}},
+            {5, {255, 0, 255}},
+        };
+
+        for (int i = 0; i < 6; i++)
+        {
+            auto test_size      = size / sizeof(uint8_t); // 图像的 宽*高*3 (BGR)
+            uint8_t* test_image = new uint8_t[test_size]();
+            for (size_t pixel = 0; pixel < test_size / 3; ++pixel)
+            {
+                test_image[pixel * 3 + 0] = test_images.at(i)[0];
+                test_image[pixel * 3 + 1] = test_images.at(i)[1];
+                test_image[pixel * 3 + 2] = test_images.at(i)[2];
+            }
+
+            //----------------- BGR数据填充至图像帧 -------------------
+            memcpy(buffer, test_image, size);
+            delete[] test_image;
+
+            // 进行图像格式转换
+            sws_scale(imgCtx, rgbFrame->data, rgbFrame->linesize, 0, codecCtx->height, yuvFrame->data, yuvFrame->linesize);
+
+            for (int j = 0; j < perFrameCnt; j++)
+            {
+                // 设置 pts 值，用于度量解码后视频帧位置
+                yuvFrame->pts = i * perFrameCnt + j;
+
+                // 编码
+                rgb2mp4Encode(codecCtx, yuvFrame, pkt, vStream, fmtCtx);
+            }
+        }
+
+        // 刷新解码缓冲区
+        rgb2mp4Encode(codecCtx, NULL, pkt, vStream, fmtCtx);
+
+        // 向文件中写入文件尾部标识，并释放该文件
+        av_write_trailer(fmtCtx);
+
+        av_free(buffer);
+        av_free(yuvBuffer);
+        sws_freeContext(imgCtx);
+    } while (0);
+
+    av_packet_free(&pkt);
+
+    if (fmtCtx)
+        avformat_free_context(fmtCtx);
+
+    if (codecCtx)
+        avcodec_free_context(&codecCtx);
+
+    if (rgbFrame)
+        av_frame_free(&rgbFrame);
+    if (yuvFrame)
+        av_frame_free(&yuvFrame);
+}
+
+int main()
+{
+    rgb2mp4("output.mp4"); // 将文件后缀设置为 flv mkv avi 都可以成功保存
+
+    return 0;
+}
+
+#endif // TEST5
