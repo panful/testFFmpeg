@@ -4,9 +4,10 @@
  * 3. 查看视频流信息
  * 4. 视频流解码，保存指定帧为图片
  * 5. 多个图片保存为 mp4(mkv flv avi) 文件
+ * 6. 图片转换为视频封装为类
  */
 
-#define TEST5
+#define TEST6
 
 #ifdef TEST1
 
@@ -597,3 +598,365 @@ int main()
 }
 
 #endif // TEST5
+
+#ifdef TEST6
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#include <array>
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+struct RGBData
+{
+    std::vector<uint8_t> rgb {};
+    uint32_t width {};
+    uint32_t height {};
+};
+
+class FFMPEGWriter
+{
+public:
+    void Start()
+    {
+        if (avformat_alloc_output_context2(&m_formatContext, nullptr, nullptr, m_fileName.c_str()) < 0)
+        {
+            throw std::runtime_error("Cannot alloc output file context");
+        }
+
+        if (avio_open(&m_formatContext->pb, m_fileName.c_str(), AVIO_FLAG_READ_WRITE) < 0)
+        {
+            throw std::runtime_error("Cannot open output file: " + m_fileName);
+        }
+
+        const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        if (!codec)
+        {
+            throw std::runtime_error("Cannot find any endcoder");
+        }
+
+        m_codecContext = avcodec_alloc_context3(codec);
+        if (!m_codecContext)
+        {
+            throw std::runtime_error("Cannot alloc codec context");
+        }
+
+        m_stream = avformat_new_stream(m_formatContext, codec);
+        if (!m_stream)
+        {
+            throw std::runtime_error("Cannot new video stream");
+        }
+
+        m_stream->time_base = AVRational {1, m_frameRate};
+
+        AVCodecParameters* param = m_stream->codecpar;
+        param->width             = m_dim[0];
+        param->height            = m_dim[1];
+        param->codec_type        = AVMEDIA_TYPE_VIDEO;
+
+        if (avcodec_parameters_to_context(m_codecContext, param) < 0)
+        {
+            throw std::runtime_error("Cannot copy codec parameters");
+        }
+
+        m_codecContext->pix_fmt   = AV_PIX_FMT_YUV420P;
+        m_codecContext->time_base = AVRational {1, m_frameRate};
+        m_codecContext->bit_rate  = m_bitRate;
+        m_codecContext->gop_size  = m_frameRate;
+
+        if (m_formatContext->oformat->flags & AVFMT_GLOBALHEADER)
+        {
+            m_codecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        if (codec->id == AV_CODEC_ID_H264)
+        {
+            m_codecContext->qmin      = 10;
+            m_codecContext->qmax      = 51;
+            m_codecContext->qcompress = 0.6f;
+        }
+
+        if (avcodec_open2(m_codecContext, codec, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot open encoder");
+        }
+
+        avcodec_parameters_from_context(param, m_codecContext);
+
+        m_rgbFrame         = av_frame_alloc();
+        m_rgbFrame->width  = m_codecContext->width;
+        m_rgbFrame->height = m_codecContext->height;
+        m_rgbFrame->format = m_imageFormat;
+
+        auto rgbSize = av_image_get_buffer_size(static_cast<AVPixelFormat>(m_rgbFrame->format), m_codecContext->width, m_codecContext->height, 1);
+
+        m_yuvFrame         = av_frame_alloc();
+        m_yuvFrame->width  = m_codecContext->width;
+        m_yuvFrame->height = m_codecContext->height;
+        m_yuvFrame->format = m_codecContext->pix_fmt;
+
+        auto yuvSize = av_image_get_buffer_size(static_cast<AVPixelFormat>(m_yuvFrame->format), m_codecContext->width, m_codecContext->height, 1);
+        m_yuvBuffer  = static_cast<uint8_t*>(av_malloc(yuvSize));
+        if (av_image_fill_arrays(
+                m_yuvFrame->data,
+                m_yuvFrame->linesize,
+                m_yuvBuffer,
+                static_cast<AVPixelFormat>(m_yuvFrame->format),
+                m_codecContext->width,
+                m_codecContext->height,
+                1
+            )
+            < 0)
+        {
+            throw std::runtime_error("Cannot filled yuvFrame");
+        }
+
+        m_swsContext = sws_getContext(
+            m_codecContext->width,
+            m_codecContext->height,
+            m_imageFormat,
+            m_codecContext->width,
+            m_codecContext->height,
+            m_codecContext->pix_fmt,
+            0,
+            nullptr,
+            nullptr,
+            nullptr
+        );
+
+        if (avformat_write_header(m_formatContext, nullptr) != AVSTREAM_INIT_IN_WRITE_HEADER)
+        {
+            throw std::runtime_error("Cannot write file header");
+        }
+
+        m_packet = av_packet_alloc();
+        if (av_new_packet(m_packet, rgbSize) < 0)
+        {
+            throw std::runtime_error("Canot new packet");
+        }
+
+        m_currentImageIndex = 0;
+    }
+
+    void Write(const RGBData& data)
+    {
+        if (data.width == m_codecContext->width && data.height == m_codecContext->height)
+        {
+            if (av_image_fill_arrays(
+                    m_rgbFrame->data,
+                    m_rgbFrame->linesize,
+                    data.rgb.data(),
+                    static_cast<AVPixelFormat>(m_rgbFrame->format),
+                    m_codecContext->width,
+                    m_codecContext->height,
+                    1
+                )
+                < 0)
+            {
+                throw std::runtime_error("Cannot filled rgbFrame");
+            }
+
+            if (sws_scale(m_swsContext, m_rgbFrame->data, m_rgbFrame->linesize, 0, m_codecContext->height, m_yuvFrame->data, m_yuvFrame->linesize)
+                < 0)
+            {
+                throw std::runtime_error("Cannot scale image data");
+            }
+        }
+        else
+        {
+            // 如果输入的图片大小与预期的大小不一致，先对输入图像进行缩放
+            auto tempSwsContext = sws_getContext(
+                data.width,
+                data.height,
+                m_imageFormat,
+                m_codecContext->width,
+                m_codecContext->height,
+                m_codecContext->pix_fmt,
+                SWS_BILINEAR,
+                nullptr,
+                nullptr,
+                nullptr
+            );
+
+            auto tempRGBFrame    = av_frame_alloc();
+            tempRGBFrame->width  = data.width;
+            tempRGBFrame->height = data.height;
+            tempRGBFrame->format = m_imageFormat;
+
+            if (av_image_fill_arrays(
+                    tempRGBFrame->data,
+                    tempRGBFrame->linesize,
+                    data.rgb.data(),
+                    static_cast<AVPixelFormat>(tempRGBFrame->format),
+                    data.width,
+                    data.height,
+                    1
+                )
+                < 0)
+            {
+                throw std::runtime_error("Cannot filled tempRGBFrame");
+            }
+
+            if (sws_scale(tempSwsContext, tempRGBFrame->data, tempRGBFrame->linesize, 0, data.height, m_yuvFrame->data, m_yuvFrame->linesize) < 0)
+            {
+                throw std::runtime_error("Cannot scale image data");
+            }
+
+            sws_freeContext(tempSwsContext);
+            av_frame_free(&tempRGBFrame);
+        }
+
+        for (auto i = 0; i < m_frameRate; ++i)
+        {
+            m_yuvFrame->pts = m_currentImageIndex * m_frameRate + i;
+            RGBToH264Encode(m_yuvFrame);
+        }
+
+        m_currentImageIndex++;
+    }
+
+    void End()
+    {
+        RGBToH264Encode(nullptr);
+
+        av_write_trailer(m_formatContext);
+
+        avformat_free_context(m_formatContext);
+        avcodec_free_context(&m_codecContext);
+
+        sws_freeContext(m_swsContext);
+        av_packet_free(&m_packet);
+        av_free(m_yuvBuffer);
+        av_frame_free(&m_rgbFrame);
+        av_frame_free(&m_yuvFrame);
+    }
+
+private:
+    void RGBToH264Encode(AVFrame* yuvFrame)
+    {
+        if (avcodec_send_frame(m_codecContext, yuvFrame) < 0)
+        {
+            throw std::runtime_error("Cannot send frame");
+        }
+
+        while (avcodec_receive_packet(m_codecContext, m_packet) >= 0)
+        {
+            m_packet->stream_index = m_stream->index;
+            m_packet->pos          = -1;
+
+            av_packet_rescale_ts(m_packet, m_codecContext->time_base, m_stream->time_base);
+            if (av_interleaved_write_frame(m_formatContext, m_packet) < 0)
+            {
+                throw std::runtime_error("Cannot write frame");
+            }
+        }
+    }
+
+private:
+    std::array<uint32_t, 2> m_dim {800, 600};
+    std::string m_fileName {"output.mp4"};
+    int m_frameRate {30};
+    int m_bitRate {1024 * 256};
+    int64_t m_currentImageIndex {};
+    AVPixelFormat m_imageFormat {AV_PIX_FMT_RGB24};
+
+    AVCodecContext* m_codecContext {};
+    AVFormatContext* m_formatContext {};
+    SwsContext* m_swsContext {};
+
+    AVStream* m_stream {};
+    AVPacket* m_packet {};
+
+    AVFrame* m_rgbFrame {};
+    AVFrame* m_yuvFrame {};
+
+    uint8_t* m_yuvBuffer {};
+};
+
+int main()
+{
+    try
+    {
+        FFMPEGWriter writer {};
+        writer.Start();
+
+        std::map<uint32_t, std::array<uint8_t, 3>> test_images {
+            {0, {255, 0, 0}    },
+            {1, {0, 255, 0}    },
+            {2, {0, 0, 255}    },
+            {3, {255, 255, 0}  },
+            {4, {0, 255, 255}  },
+            {5, {255, 0, 255}  },
+            {6, {255, 255, 255}},
+            {7, {0, 0, 255}    },
+            {8, {0, 255, 0}    },
+            {9, {255, 0, 0}    },
+        };
+
+        for (auto i = 0u; i < 10u; i++)
+        {
+            RGBData data {};
+            data.width  = 800;
+            data.height = 600;
+            data.rgb.clear();
+            data.rgb.reserve(800 * 600 * 3);
+            for (auto w = 0u; w < 800u; w++)
+            {
+                for (auto h = 0u; h < 600u; h++)
+                {
+                    data.rgb.emplace_back(test_images.at(i)[0]);
+                    data.rgb.emplace_back(test_images.at(i)[1]);
+                    data.rgb.emplace_back(test_images.at(i)[2]);
+                }
+            }
+
+            writer.Write(data);
+        }
+
+        for (auto i = 0u; i < 10u; i++)
+        {
+            RGBData data {};
+            data.width  = 400;
+            data.height = 300;
+            data.rgb.clear();
+            data.rgb.reserve(400 * 300 * 3);
+            for (auto w = 0u; w < 400u; w++)
+            {
+                for (auto h = 0u; h < 300u; h++)
+                {
+                    data.rgb.emplace_back(test_images.at(i)[0]);
+                    data.rgb.emplace_back(test_images.at(i)[1]);
+                    data.rgb.emplace_back(test_images.at(i)[2]);
+                }
+            }
+
+            writer.Write(data);
+        }
+
+        writer.End();
+    }
+    catch (std::exception& e)
+    {
+        std::cout << e.what() << std::endl;
+    }
+    catch (...)
+    {
+        std::cout << "Unknow error\n";
+    }
+}
+
+#endif // TEST6
