@@ -3,11 +3,12 @@
  * 2. 输出 FFMPEG 的版本
  * 3. 查看视频流信息
  * 4. 视频流解码，保存指定帧为图片
- * 5. 多个图片保存为 mp4(mkv flv avi) 文件
- * 6. 图片转换为视频封装为类
+ * 5. 多个图片（像素数据）保存为 mp4(mkv flv avi) 文件
+ * 6. 封装图片保存为视频为一个类
+ * 7. 将像素数据保存为图片
  */
 
-#define TEST6
+#define TEST7
 
 #ifdef TEST1
 
@@ -963,3 +964,189 @@ int main()
 }
 
 #endif // TEST6
+
+#ifdef TEST7
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#include <array>
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+struct RGBData
+{
+    std::vector<uint8_t> rgb {};
+    uint32_t width {};
+    uint32_t height {};
+};
+
+class FFMPEGImageWriter
+{
+public:
+    explicit FFMPEGImageWriter(const std::string& fileName, int width, int height)
+        : m_fileName(fileName)
+        , m_width(width)
+        , m_height(height)
+    {
+    }
+
+    void Write(const RGBData& data)
+    {
+        Start();
+
+        if (data.width == m_width && data.height == m_height)
+        {
+            if (av_image_fill_arrays(m_rgbFrame->data, m_rgbFrame->linesize, data.rgb.data(), m_codecContext->pix_fmt, m_width, m_height, 1) < 0)
+            {
+                throw std::runtime_error("Cannot fill rgbFrame");
+            }
+        }
+        else
+        {
+            throw std::runtime_error("Input image size does not match output size");
+        }
+
+        EncodeAndSave();
+        End();
+    }
+
+private:
+    void Start()
+    {
+        // 创建输出文件上下文
+        if (avformat_alloc_output_context2(&m_formatContext, nullptr, nullptr, m_fileName.c_str()) < 0)
+        {
+            throw std::runtime_error("Cannot alloc output file context");
+        }
+
+        if (avio_open(&m_formatContext->pb, m_fileName.c_str(), AVIO_FLAG_WRITE) < 0)
+        {
+            throw std::runtime_error("Cannot open output file: " + m_fileName);
+        }
+
+        // 设置 PNG 编码器
+        const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+        if (!codec)
+        {
+            throw std::runtime_error("Cannot find any encoder");
+        }
+
+        m_codecContext = avcodec_alloc_context3(codec);
+        if (!m_codecContext)
+        {
+            throw std::runtime_error("Cannot alloc codec context");
+        }
+
+        // 设置编码参数
+        m_codecContext->width     = m_width;
+        m_codecContext->height    = m_height;
+        m_codecContext->pix_fmt   = AV_PIX_FMT_RGB24; // 使用 RGB24 格式
+        m_codecContext->time_base = AVRational {1, 25};
+
+        // 创建流并添加编码参数
+        m_stream = avformat_new_stream(m_formatContext, codec);
+        if (!m_stream)
+        {
+            throw std::runtime_error("Cannot create video stream");
+        }
+        m_stream->time_base = m_codecContext->time_base;
+
+        if (avcodec_open2(m_codecContext, codec, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot open encoder");
+        }
+
+        avcodec_parameters_from_context(m_stream->codecpar, m_codecContext);
+
+        // 分配 RGB 帧
+        m_rgbFrame         = av_frame_alloc();
+        m_rgbFrame->width  = m_width;
+        m_rgbFrame->height = m_height;
+        m_rgbFrame->format = AV_PIX_FMT_RGB24;
+
+        auto rgbSize = av_image_get_buffer_size(m_codecContext->pix_fmt, m_width, m_height, 1);
+        m_rgbBuffer  = static_cast<uint8_t*>(av_malloc(rgbSize));
+
+        if (av_image_fill_arrays(m_rgbFrame->data, m_rgbFrame->linesize, m_rgbBuffer, m_codecContext->pix_fmt, m_width, m_height, 1) < 0)
+        {
+            throw std::runtime_error("Cannot fill rgbFrame");
+        }
+
+        if (avformat_write_header(m_formatContext, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot write file header");
+        }
+    }
+
+    void EncodeAndSave()
+    {
+        if (avcodec_send_frame(m_codecContext, m_rgbFrame) < 0)
+        {
+            throw std::runtime_error("Cannot send frame");
+        }
+
+        AVPacket* packet = av_packet_alloc();
+        while (avcodec_receive_packet(m_codecContext, packet) == 0)
+        {
+            av_interleaved_write_frame(m_formatContext, packet);
+            av_packet_unref(packet);
+        }
+    }
+
+    void End()
+    {
+        av_write_trailer(m_formatContext);
+        avformat_free_context(m_formatContext);
+        avcodec_free_context(&m_codecContext);
+
+        av_free(m_rgbBuffer);
+        av_frame_free(&m_rgbFrame);
+    }
+
+private:
+    std::string m_fileName;
+    int m_width, m_height;
+    AVFormatContext* m_formatContext {};
+    AVCodecContext* m_codecContext {};
+    AVStream* m_stream {};
+    AVFrame* m_rgbFrame {};
+    uint8_t* m_rgbBuffer {};
+};
+
+int main()
+{
+    try
+    {
+        RGBData data;
+        data.width  = 800;
+        data.height = 600;
+        data.rgb.resize(800 * 600 * 3, 128); // 白色图片
+
+        FFMPEGImageWriter imageWriter("output.png", 800, 600);
+        imageWriter.Write(data);
+
+        std::cout << "Image saved successfully.\n";
+    }
+    catch (std::exception& e)
+    {
+        std::cerr << e.what() << '\n';
+    }
+
+    return 0;
+}
+
+#endif // TEST7
