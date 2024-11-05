@@ -12,6 +12,21 @@
 - GPL Shared 是一种修改过的GPL版本，它允许FFmpeg以共享库的形式使用，而不要求使用FFmpeg的应用程序必须使用GPL许可证。这允许您将FFmpeg嵌入到专有应用程序中而无需开放应用程序的源代码。 这种许可证是一种GPL的例外，允许FFmpeg以库的形式被链接到专有软件中。
 ## 编译
 [在Windows上编译ffmpeg](https://zhuanlan.zhihu.com/p/707298876)
+
+[MSYS2](https://www.msys2.org/)
+
+[MSYS2包](https://packages.msys2.org/queue)
+
+**windows使用批处理命令编译FFmpeg**
+```
+@echo off
+
+set MSYS2_PATH=C:/msys64/msys2_shell.cmd
+set FFMPEG_PATH=/c/ffmpeg_path
+set OUTPUT_PATH=/c/install_path
+
+start "" %MSYS2_PATH% -defterm -no-start -ucrt64 -c "cd %FFMPEG_PATH% && ./configure --prefix=%OUTPUT_PATH% --pkg-config-flags=--static --extra-ldflags=-static --disable-static --enable-shared --disable-doc --arch=x86_64 --disable-avx512 && make && make install"
+```
 ## 使用
 - CMake
 ```
