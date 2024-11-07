@@ -17,7 +17,8 @@ else()
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/target)
 endif()
 
-find_package(FFMPEG REQUIRED COMPONENTS avcodec avformat avutil avfilter swresample swscale)
+set(FFmpeg_required_componets avcodec avformat avutil avfilter swresample swscale)
+find_package(FFMPEG REQUIRED COMPONENTS ${FFmpeg_required_componets})
 
 if(FFMPEG_FOUND)
     message("---------------- found FFMPEG")
@@ -27,6 +28,17 @@ if(FFMPEG_FOUND)
 else()
     message(FATAL_ERROR "---------------- not found FFMPEG")
 endif()
+
+
+set(bin_dir "${FFMPEG_ROOT}/bin")
+foreach(dll_name ${FFmpeg_required_componets})
+    file(GLOB dll_files "${bin_dir}/${dll_name}-*.dll")
+    
+    foreach(dll_file ${dll_files})
+        file(COPY ${dll_file} DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/target)
+        break()
+    endforeach()
+endforeach()
 
 set(target_name "Test")
 
