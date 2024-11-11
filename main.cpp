@@ -8,7 +8,7 @@
  * 7. 将像素数据保存为图片
  */
 
-#define TEST7
+#define TEST6
 
 #ifdef TEST1
 
@@ -635,8 +635,24 @@ struct RGBData
 class FFMPEGWriter
 {
 public:
-    void Start()
+    FFMPEGWriter() noexcept
     {
+    }
+
+    ~FFMPEGWriter() noexcept
+    {
+        ReleaseResources();
+    }
+
+    FFMPEGWriter(const FFMPEGWriter&) = delete;
+
+    FFMPEGWriter& operator=(const FFMPEGWriter&) = delete;
+
+    void Open()
+    {
+        // 设置日志等级
+        // av_log_set_level(AV_LOG_ERROR);
+
         if (avformat_alloc_output_context2(&m_formatContext, nullptr, nullptr, m_fileName.c_str()) < 0)
         {
             throw std::runtime_error("Cannot alloc output file context");
@@ -677,10 +693,11 @@ public:
             throw std::runtime_error("Cannot copy codec parameters");
         }
 
-        m_codecContext->pix_fmt   = AV_PIX_FMT_YUV420P;
-        m_codecContext->time_base = AVRational {1, m_frameRate};
-        m_codecContext->bit_rate  = m_bitRate;
-        m_codecContext->gop_size  = m_frameRate;
+        m_codecContext->pix_fmt            = AV_PIX_FMT_YUV420P;
+        m_codecContext->time_base          = AVRational {1, m_frameRate};
+        m_codecContext->bit_rate           = m_bitRate;
+        m_codecContext->gop_size           = m_frameRate;
+        m_codecContext->bit_rate_tolerance = m_bitRate;
 
         if (m_formatContext->oformat->flags & AVFMT_GLOBALHEADER)
         {
@@ -801,27 +818,33 @@ public:
             tempRGBFrame->height = data.height;
             tempRGBFrame->format = m_imageFormat;
 
-            if (av_image_fill_arrays(
-                    tempRGBFrame->data,
-                    tempRGBFrame->linesize,
-                    data.rgb.data(),
-                    static_cast<AVPixelFormat>(tempRGBFrame->format),
-                    data.width,
-                    data.height,
-                    1
-                )
-                < 0)
+            try
             {
-                throw std::runtime_error("Cannot filled tempRGBFrame");
-            }
+                if (av_image_fill_arrays(
+                        tempRGBFrame->data,
+                        tempRGBFrame->linesize,
+                        data.rgb.data(),
+                        static_cast<AVPixelFormat>(tempRGBFrame->format),
+                        data.width,
+                        data.height,
+                        1
+                    )
+                    < 0)
+                {
+                    throw std::runtime_error("Cannot filled tempRGBFrame");
+                }
 
-            if (sws_scale(tempSwsContext, tempRGBFrame->data, tempRGBFrame->linesize, 0, data.height, m_yuvFrame->data, m_yuvFrame->linesize) < 0)
+                if (sws_scale(tempSwsContext, tempRGBFrame->data, tempRGBFrame->linesize, 0, data.height, m_yuvFrame->data, m_yuvFrame->linesize) < 0)
+                {
+                    throw std::runtime_error("Cannot scale image data");
+                }
+            }
+            catch (...)
             {
-                throw std::runtime_error("Cannot scale image data");
+                sws_freeContext(tempSwsContext);
+                av_frame_free(&tempRGBFrame);
+                throw;
             }
-
-            sws_freeContext(tempSwsContext);
-            av_frame_free(&tempRGBFrame);
         }
 
         for (auto i = 0; i < m_frameRate; ++i)
@@ -833,20 +856,14 @@ public:
         m_currentImageIndex++;
     }
 
-    void End()
+    void Close()
     {
         RGBToH264Encode(nullptr);
 
+        // 写入文件尾部标识，并释放该文件
         av_write_trailer(m_formatContext);
 
-        avformat_free_context(m_formatContext);
-        avcodec_free_context(&m_codecContext);
-
-        sws_freeContext(m_swsContext);
-        av_packet_free(&m_packet);
-        av_free(m_yuvBuffer);
-        av_frame_free(&m_rgbFrame);
-        av_frame_free(&m_yuvFrame);
+        ReleaseResources();
     }
 
 private:
@@ -870,11 +887,58 @@ private:
         }
     }
 
+    void ReleaseResources() noexcept
+    {
+        if (m_formatContext)
+        {
+            if (m_formatContext->pb)
+            {
+                avio_close(m_formatContext->pb);
+                m_formatContext->pb = nullptr;
+            }
+
+            avformat_free_context(m_formatContext);
+            m_formatContext = nullptr;
+        }
+
+        if (m_codecContext)
+        {
+            avcodec_free_context(&m_codecContext);
+        }
+
+        if (m_swsContext)
+        {
+            sws_freeContext(m_swsContext);
+            m_swsContext = nullptr;
+        }
+
+        if (m_packet)
+        {
+            av_packet_free(&m_packet);
+        }
+
+        if (m_yuvBuffer)
+        {
+            av_free(m_yuvBuffer);
+            m_yuvBuffer = nullptr;
+        }
+
+        if (m_rgbFrame)
+        {
+            av_frame_free(&m_rgbFrame);
+        }
+
+        if (m_yuvFrame)
+        {
+            av_frame_free(&m_yuvFrame);
+        }
+    }
+
 private:
     std::array<uint32_t, 2> m_dim {800, 600};
     std::string m_fileName {"output.mp4"};
     int m_frameRate {30};
-    int m_bitRate {1024 * 256};
+    int m_bitRate {3 * 1024 * 1024};
     int64_t m_currentImageIndex {};
     AVPixelFormat m_imageFormat {AV_PIX_FMT_RGB24};
 
@@ -896,7 +960,7 @@ int main()
     try
     {
         FFMPEGWriter writer {};
-        writer.Start();
+        writer.Open();
 
         std::map<uint32_t, std::array<uint8_t, 3>> test_images {
             {0, {255, 0, 0}    },
@@ -951,15 +1015,15 @@ int main()
             writer.Write(data);
         }
 
-        writer.End();
+        writer.Close();
     }
     catch (std::exception& e)
     {
-        std::cout << e.what() << std::endl;
+        std::cerr << e.what() << std::endl;
     }
     catch (...)
     {
-        std::cout << "Unknow error\n";
+        std::cerr << "Unknow error\n";
     }
 }
 
