@@ -639,6 +639,14 @@ public:
     {
     }
 
+    FFMPEGWriter(std::string&& fileName, const std::array<uint32_t, 2>& dim, int frameRate, int bitRate)
+        : m_fileName(std::move(fileName))
+        , m_dim(dim)
+        , m_frameRate(frameRate)
+        , m_bitRate(bitRate)
+    {
+    }
+
     ~FFMPEGWriter() noexcept
     {
         ReleaseResources();
@@ -651,8 +659,10 @@ public:
     void Open()
     {
         // 设置日志等级
-        // av_log_set_level(AV_LOG_ERROR);
+        av_log_set_level(AV_LOG_WARNING);
 
+        // 创建输出媒体文件的上下文
+        // AVFormatContext 表示一个媒体文件的整体信息，如格式、流、编码器等
         if (avformat_alloc_output_context2(&m_formatContext, nullptr, nullptr, m_fileName.c_str()) < 0)
         {
             throw std::runtime_error("Cannot alloc output file context");
@@ -663,24 +673,30 @@ public:
             throw std::runtime_error("Cannot open output file: " + m_fileName);
         }
 
-        const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        const AVCodec* codec = avcodec_find_encoder(m_formatContext->oformat->video_codec);
         if (!codec)
         {
             throw std::runtime_error("Cannot find any endcoder");
         }
 
+        // AVCodecContext: 代表编码器上下文，保存与编码器相关的所有配置和参数。
         m_codecContext = avcodec_alloc_context3(codec);
         if (!m_codecContext)
         {
             throw std::runtime_error("Cannot alloc codec context");
         }
 
+        // 创建一个新的视频流，每个流代表一个视频或音频的轨道
         m_stream = avformat_new_stream(m_formatContext, codec);
         if (!m_stream)
         {
             throw std::runtime_error("Cannot new video stream");
         }
 
+        // 时间基准
+        // num: 每 num 个时间单位是1帧的时间跨度
+        // den: 每秒的帧数
+        // {2, 30} 表示每帧的时间跨度是 1/15 秒，帧率是 30FPS
         m_stream->time_base = AVRational {1, m_frameRate};
 
         AVCodecParameters* param = m_stream->codecpar;
@@ -693,17 +709,19 @@ public:
             throw std::runtime_error("Cannot copy codec parameters");
         }
 
-        m_codecContext->pix_fmt            = AV_PIX_FMT_YUV420P;
-        m_codecContext->time_base          = AVRational {1, m_frameRate};
-        m_codecContext->bit_rate           = m_bitRate;
-        m_codecContext->gop_size           = m_frameRate;
-        m_codecContext->bit_rate_tolerance = m_bitRate;
+        m_codecContext->pix_fmt   = AV_PIX_FMT_YUV420P;  // 视频像素格式
+        m_codecContext->time_base = m_stream->time_base; // 时间基准，大多数情况下，和 AVStream 的时间基准应该一致
+        m_codecContext->bit_rate  = m_bitRate;           // 比特率，越大视频质量越高，文件越大
+        m_codecContext->gop_size  = m_frameRate;         // 关键帧间隔，越小文件越大，越适用于场景变化多的视频
 
         if (m_formatContext->oformat->flags & AVFMT_GLOBALHEADER)
         {
             m_codecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         }
 
+        // qmin qmax (Quantization parameter)
+        // 编码器量化参数决定了图像的压缩率和画质，数值越小画质越好，但文件越大
+        // qcompress 控制量化参数随场景复杂度变化的响应速度，0标识完全不变，1标识完全适应场景复杂度的变化
         if (codec->id == AV_CODEC_ID_H264)
         {
             m_codecContext->qmin      = 10;
@@ -799,54 +817,53 @@ public:
         }
         else
         {
-            // 如果输入的图片大小与预期的大小不一致，先对输入图像进行缩放
-            auto tempSwsContext = sws_getContext(
-                data.width,
-                data.height,
-                m_imageFormat,
-                m_codecContext->width,
-                m_codecContext->height,
-                m_codecContext->pix_fmt,
-                SWS_BILINEAR,
-                nullptr,
-                nullptr,
-                nullptr
-            );
-
-            auto tempRGBFrame    = av_frame_alloc();
-            tempRGBFrame->width  = data.width;
-            tempRGBFrame->height = data.height;
-            tempRGBFrame->format = m_imageFormat;
-
-            try
+            // 当图像尺寸不匹配时，进行缩放处理
+            if (!m_scaleSwsContext)
             {
-                if (av_image_fill_arrays(
-                        tempRGBFrame->data,
-                        tempRGBFrame->linesize,
-                        data.rgb.data(),
-                        static_cast<AVPixelFormat>(tempRGBFrame->format),
-                        data.width,
-                        data.height,
-                        1
-                    )
-                    < 0)
-                {
-                    throw std::runtime_error("Cannot filled tempRGBFrame");
-                }
-
-                if (sws_scale(tempSwsContext, tempRGBFrame->data, tempRGBFrame->linesize, 0, data.height, m_yuvFrame->data, m_yuvFrame->linesize) < 0)
-                {
-                    throw std::runtime_error("Cannot scale image data");
-                }
+                m_scaleSwsContext = sws_getContext(
+                    data.width,
+                    data.height,
+                    m_imageFormat,
+                    m_codecContext->width,
+                    m_codecContext->height,
+                    m_codecContext->pix_fmt,
+                    SWS_BICUBIC,
+                    nullptr,
+                    nullptr,
+                    nullptr
+                );
             }
-            catch (...)
+
+            if (!m_scaleFrame)
             {
-                sws_freeContext(tempSwsContext);
-                av_frame_free(&tempRGBFrame);
-                throw;
+                m_scaleFrame = av_frame_alloc();
+            }
+
+            m_scaleFrame->width  = data.width;
+            m_scaleFrame->height = data.height;
+            m_scaleFrame->format = m_imageFormat;
+
+            if (av_image_fill_arrays(
+                    m_scaleFrame->data,
+                    m_scaleFrame->linesize,
+                    data.rgb.data(),
+                    static_cast<AVPixelFormat>(m_scaleFrame->format),
+                    data.width,
+                    data.height,
+                    1
+                )
+                < 0)
+            {
+                throw std::runtime_error("Cannot filled scaleFrame");
+            }
+
+            if (sws_scale(m_scaleSwsContext, m_scaleFrame->data, m_scaleFrame->linesize, 0, data.height, m_yuvFrame->data, m_yuvFrame->linesize) < 0)
+            {
+                throw std::runtime_error("Cannot scale image data");
             }
         }
 
+        // 一张图像显示 m_frameRate 帧
         for (auto i = 0; i < m_frameRate; ++i)
         {
             m_yuvFrame->pts = m_currentImageIndex * m_frameRate + i;
@@ -864,6 +881,8 @@ public:
         av_write_trailer(m_formatContext);
 
         ReleaseResources();
+
+        m_currentImageIndex = 0;
     }
 
 private:
@@ -912,6 +931,17 @@ private:
             m_swsContext = nullptr;
         }
 
+        if (m_scaleSwsContext)
+        {
+            sws_freeContext(m_scaleSwsContext);
+            m_scaleSwsContext = nullptr;
+        }
+
+        if (m_scaleFrame)
+        {
+            av_frame_free(&m_scaleFrame);
+        }
+
         if (m_packet)
         {
             av_packet_free(&m_packet);
@@ -935,16 +965,19 @@ private:
     }
 
 private:
-    std::array<uint32_t, 2> m_dim {800, 600};
-    std::string m_fileName {"output.mp4"};
-    int m_frameRate {30};
-    int m_bitRate {3 * 1024 * 1024};
-    int64_t m_currentImageIndex {};
-    AVPixelFormat m_imageFormat {AV_PIX_FMT_RGB24};
+    std::array<uint32_t, 2> m_dim {800, 600};       // 视频文件的宽和高
+    std::string m_fileName {"output.mp4"};          // 视频文件名
+    int m_frameRate {30};                           // 帧率 FPS
+    int m_bitRate {3 * 1024 * 1024};                // 比特率
+    AVPixelFormat m_imageFormat {AV_PIX_FMT_RGB24}; // 输入图像的数据类型
 
+    int64_t m_currentImageIndex {};
     AVCodecContext* m_codecContext {};
     AVFormatContext* m_formatContext {};
     SwsContext* m_swsContext {};
+
+    SwsContext* m_scaleSwsContext {};
+    AVFrame* m_scaleFrame {};
 
     AVStream* m_stream {};
     AVPacket* m_packet {};
