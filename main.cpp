@@ -1,14 +1,17 @@
 /**
- * 1. 测试 FFMPEG 环境
- * 2. 输出 FFMPEG 的版本
- * 3. 查看视频流信息
- * 4. 视频流解码，保存指定帧为图片
- * 5. 多个图片（像素数据）保存为 mp4(mkv flv avi) 文件
- * 6. 封装图片保存为视频为一个类
- * 7. 将像素数据保存为图片
+ * 01. 测试 FFMPEG 环境
+ * 02. 输出 FFMPEG 的版本
+ * 03. 查看视频流信息
+ * 04. 视频流解码，保存指定帧为图片
+ * 05. 多个图片（像素数据）保存为 mp4(mkv flv avi) 文件
+ * 06. 封装图片保存为视频
+ * 07. 将像素数据保存为图片
+ * 08. 封装读取视频的帧
+ * 09. OpenGL 渲染纹理
+ * 10. 播放视频
  */
 
-#define TEST6
+#define TEST10
 
 #ifdef TEST1
 
@@ -1247,3 +1250,881 @@ int main()
 }
 
 #endif // TEST7
+
+#ifdef TEST8
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
+#include <iostream>
+#include <string>
+
+class FFmpegReader
+{
+    std::string mFileName {"../resources/test.mp4"};
+
+    AVFormatContext* mFormatContext {};
+    AVCodecContext* mCodecContext {};
+    SwsContext* mSwsContext {};
+
+    AVPacket* mPacket {};
+    AVFrame* mRGBFrame {};
+    AVFrame* mYUVFrame {};
+
+    uint8_t* mOutBuffer {};
+    int mVideoIndex {-1};
+
+public:
+    FFmpegReader() noexcept = default;
+
+    ~FFmpegReader() noexcept
+    {
+        ReleaseResources();
+    }
+
+    FFmpegReader(const FFmpegReader&) = delete;
+
+    FFmpegReader& operator=(const FFmpegReader&) = delete;
+
+    void Open()
+    {
+        mFormatContext = avformat_alloc_context();
+
+        if (avformat_open_input(&mFormatContext, mFileName.c_str(), nullptr, nullptr))
+        {
+            throw std::runtime_error("Cannot open file");
+        }
+
+        if (avformat_find_stream_info(mFormatContext, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot find stream information");
+        }
+
+        for (uint32_t i = 0; i < mFormatContext->nb_streams; i++)
+        {
+            if (mFormatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
+                mVideoIndex = static_cast<int>(i);
+                break;
+            }
+        }
+
+        if (mVideoIndex == -1)
+        {
+            throw std::runtime_error("Cannot find video stream");
+        }
+
+        // 打印流信息
+        // av_dump_format(fmtCtx, 0, filePath, 0);
+
+        AVCodecParameters* codecPara = mFormatContext->streams[mVideoIndex]->codecpar;
+        const AVCodec* codec         = avcodec_find_decoder(codecPara->codec_id);
+        if (codec == nullptr)
+        {
+            throw std::runtime_error("Cannot open decoder");
+        }
+
+        mCodecContext = avcodec_alloc_context3(codec);
+        if (avcodec_parameters_to_context(mCodecContext, codecPara) < 0)
+        {
+            throw std::runtime_error("Parameters to context fail");
+        }
+
+        if (avcodec_open2(mCodecContext, codec, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot open decoder");
+        }
+
+        mPacket   = av_packet_alloc();
+        mYUVFrame = av_frame_alloc();
+        mRGBFrame = av_frame_alloc();
+
+        mSwsContext = sws_getContext(
+            mCodecContext->width,
+            mCodecContext->height,
+            mCodecContext->pix_fmt,
+            mCodecContext->width,
+            mCodecContext->height,
+            AV_PIX_FMT_RGB24,
+            SWS_BICUBIC,
+            nullptr,
+            nullptr,
+            nullptr
+        );
+
+        int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, mCodecContext->width, mCodecContext->height, 1);
+        mOutBuffer   = static_cast<uint8_t*>(av_malloc(numBytes * sizeof(uint8_t)));
+
+        av_image_fill_arrays(mRGBFrame->data, mRGBFrame->linesize, mOutBuffer, AV_PIX_FMT_RGB24, mCodecContext->width, mCodecContext->height, 1);
+    }
+
+    void Read()
+    {
+        int i = 0;
+        while (av_read_frame(mFormatContext, mPacket) >= 0)
+        {
+            if (mPacket->stream_index == mVideoIndex)
+            {
+                if (avcodec_send_packet(mCodecContext, mPacket) == 0)
+                {
+                    while (avcodec_receive_frame(mCodecContext, mYUVFrame) == 0)
+                    {
+                        i++;
+
+                        // 第100帧
+                        if (i == 500)
+                        {
+                            sws_scale(
+                                mSwsContext,
+                                (const uint8_t* const*)mYUVFrame->data,
+                                mYUVFrame->linesize,
+                                0,
+                                mCodecContext->height,
+                                mRGBFrame->data,
+                                mRGBFrame->linesize
+                            );
+
+                            stbi_write_jpg("test.jpg", mCodecContext->width, mCodecContext->height, 3, mOutBuffer, 100);
+                        }
+                    }
+                }
+            }
+
+            av_packet_unref(mPacket);
+        }
+    }
+
+    void Close()
+    {
+        if (avcodec_send_packet(mCodecContext, nullptr) == 0)
+        {
+            while (avcodec_receive_frame(mCodecContext, mYUVFrame) == 0)
+            {
+            }
+        }
+    }
+
+private:
+    void ReleaseResources() noexcept
+    {
+        av_free(mOutBuffer);
+        mOutBuffer = nullptr;
+
+        sws_freeContext(mSwsContext);
+        mSwsContext = nullptr;
+
+        avcodec_free_context(&mCodecContext);
+        avformat_close_input(&mFormatContext);
+        av_packet_free(&mPacket);
+        av_frame_free(&mYUVFrame);
+        av_frame_free(&mRGBFrame);
+    }
+};
+
+int main()
+{
+    try
+    {
+        FFmpegReader reader {};
+        reader.Open();
+        reader.Read();
+        reader.Close();
+    }
+    catch (std::runtime_error& e)
+    {
+        std::cerr << e.what() << '\n';
+    }
+    catch (...)
+    {
+        std::cerr << "Unknow error\n";
+    }
+
+    return 0;
+}
+
+#endif // TEST8
+
+#ifdef TEST9
+
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+
+// clang-format off
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+// clang-format on
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+#include <iostream>
+
+const char* VS = R"(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTex;
+out vec2 texCoord;
+void main()
+{
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    texCoord = aTex;
+}
+)";
+
+const char* FS = R"(
+#version 330 core
+out vec4 FragColor;
+in vec2 texCoord;
+uniform sampler2D uTexture;
+void main()
+{
+    vec4 color = texture(uTexture, texCoord);
+    FragColor = vec4(color.rgb, 1.0);
+}
+)";
+
+int main()
+{
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(800, 600, "Video", NULL, NULL);
+    if (window == NULL)
+    {
+        std::cout << "Failed to create GLFW window\n";
+        glfwTerminate();
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+
+    // 加载glad
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
+        std::cout << "Failed to initialize GLAD\n";
+        glfwTerminate();
+        return -1;
+    }
+
+    //---------------------------------------------------------------------------------
+    // 初始化Dear ImGui
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;  // Enable Gamepad Controls
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330 core");
+    ImGui::StyleColorsDark();
+
+    //---------------------------------------------------------------------------------
+    // Shader & Program
+    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &VS, NULL);
+    glCompileShader(vertexShader);
+
+    int success {0};
+    char infoLog[512] {0};
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    if (!success)
+    {
+        glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+        std::cout << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << infoLog << std::endl;
+    }
+
+    unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &FS, NULL);
+    glCompileShader(fragmentShader);
+
+    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success)
+    {
+        glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
+        std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
+    }
+
+    unsigned int shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+
+    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+    if (!success)
+    {
+        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+        std::cout << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+    }
+    glDetachShader(shaderProgram, vertexShader);
+    glDetachShader(shaderProgram, fragmentShader);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    //---------------------------------------------------------------------------------
+    float vertices[] = {-0.5f, 0.5f, 0.0f, 1.0f, -0.5f, -0.5f, 0.0f, 0.0f, 0.5f, 0.5f, 1.0f, 1.0f, 0.5f, -0.5f, 1.0f, 0.0f};
+
+    unsigned int VBO {0}, VAO {0};
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+
+    glBindVertexArray(VAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+
+    //---------------------------------------------------------------------------------
+    unsigned int texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    int width {}, height {}, nrChannels {};
+    stbi_set_flip_vertically_on_load(true);
+    unsigned char* data = stbi_load("../resources/wood.png", &width, &height, &nrChannels, 0);
+    if (data)
+    {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+    }
+    else
+    {
+        std::cout << "Failed to load texture" << std::endl;
+    }
+    stbi_image_free(data);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    //---------------------------------------------------------------------------------
+    while (!glfwWindowShouldClose(window))
+    {
+        // 处理输入事件
+        glfwPollEvents();
+
+        // 开始新的一帧
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        //---------------------------------------------------------------------------------
+        ImGui::Begin("Play video");
+        {
+            // 显示文本
+            ImGui::Text("This is a simple GUI");
+
+            // 按钮
+            if (ImGui::Button("Test Button"))
+            {
+                // 当按钮被点击时会进入
+                std::cout << "clicked button\n";
+            }
+        }
+        ImGui::End();
+
+        int display_w {}, display_h {};
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+
+        glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // 绘制自定义图元
+        glUseProgram(shaderProgram);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        // 准备渲染GUI需要用到的数据
+        ImGui::Render();
+
+        // 绘制GUI
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // 交换缓冲区
+        glfwSwapBuffers(window);
+    }
+
+    // 清理资源
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
+    glDeleteVertexArrays(1, &VAO);
+    glDeleteBuffers(1, &VBO);
+    glDeleteProgram(shaderProgram);
+
+    // 关闭窗口和释放相关资源
+    glfwDestroyWindow(window);
+    glfwTerminate();
+
+    return 0;
+}
+
+#endif // TEST9
+
+#ifdef TEST10
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#if defined(__cplusplus)
+}
+#endif
+
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+
+// clang-format off
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+// clang-format on
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+#include <chrono>
+#include <format>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+const char* VS = R"(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTex;
+out vec2 texCoord;
+void main()
+{
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    texCoord = aTex;
+}
+)";
+
+const char* FS = R"(
+#version 330 core
+out vec4 FragColor;
+in vec2 texCoord;
+uniform sampler2D uTexture;
+void main()
+{
+    vec4 color = texture(uTexture, texCoord);
+    FragColor = vec4(color.rgb, 1.0);
+}
+)";
+
+static std::vector<std::vector<uint8_t>> VideoPixels {};
+static int VideoWidth {};
+static int VideoHeight {};
+
+class FFmpegReader
+{
+    std::string mFileName {"../resources/test.mp4"};
+
+    AVFormatContext* mFormatContext {};
+    AVCodecContext* mCodecContext {};
+    SwsContext* mSwsContext {};
+
+    AVPacket* mPacket {};
+    AVFrame* mRGBFrame {};
+    AVFrame* mYUVFrame {};
+
+    uint8_t* mOutBuffer {};
+    int mVideoIndex {-1};
+
+public:
+    FFmpegReader() noexcept = default;
+
+    ~FFmpegReader() noexcept
+    {
+        ReleaseResources();
+    }
+
+    FFmpegReader(const FFmpegReader&) = delete;
+
+    FFmpegReader& operator=(const FFmpegReader&) = delete;
+
+    void Open()
+    {
+        mFormatContext = avformat_alloc_context();
+
+        if (avformat_open_input(&mFormatContext, mFileName.c_str(), nullptr, nullptr))
+        {
+            throw std::runtime_error("Cannot open file");
+        }
+
+        if (avformat_find_stream_info(mFormatContext, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot find stream information");
+        }
+
+        for (uint32_t i = 0; i < mFormatContext->nb_streams; i++)
+        {
+            if (mFormatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
+                mVideoIndex = static_cast<int>(i);
+                break;
+            }
+        }
+
+        if (mVideoIndex == -1)
+        {
+            throw std::runtime_error("Cannot find video stream");
+        }
+
+        // 打印流信息
+        // av_dump_format(fmtCtx, 0, filePath, 0);
+
+        AVCodecParameters* codecPara = mFormatContext->streams[mVideoIndex]->codecpar;
+        const AVCodec* codec         = avcodec_find_decoder(codecPara->codec_id);
+        if (codec == nullptr)
+        {
+            throw std::runtime_error("Cannot open decoder");
+        }
+
+        mCodecContext = avcodec_alloc_context3(codec);
+        if (avcodec_parameters_to_context(mCodecContext, codecPara) < 0)
+        {
+            throw std::runtime_error("Parameters to context fail");
+        }
+
+        if (avcodec_open2(mCodecContext, codec, nullptr) < 0)
+        {
+            throw std::runtime_error("Cannot open decoder");
+        }
+
+        mPacket   = av_packet_alloc();
+        mYUVFrame = av_frame_alloc();
+        mRGBFrame = av_frame_alloc();
+
+        mSwsContext = sws_getContext(
+            mCodecContext->width,
+            mCodecContext->height,
+            mCodecContext->pix_fmt,
+            mCodecContext->width,
+            mCodecContext->height,
+            AV_PIX_FMT_RGB24,
+            SWS_BICUBIC,
+            nullptr,
+            nullptr,
+            nullptr
+        );
+
+        int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, mCodecContext->width, mCodecContext->height, 1);
+        mOutBuffer   = static_cast<uint8_t*>(av_malloc(numBytes * sizeof(uint8_t)));
+
+        av_image_fill_arrays(mRGBFrame->data, mRGBFrame->linesize, mOutBuffer, AV_PIX_FMT_RGB24, mCodecContext->width, mCodecContext->height, 1);
+    }
+
+    void Read()
+    {
+        while (av_read_frame(mFormatContext, mPacket) >= 0)
+        {
+            if (mPacket->stream_index == mVideoIndex)
+            {
+                if (avcodec_send_packet(mCodecContext, mPacket) == 0)
+                {
+                    while (avcodec_receive_frame(mCodecContext, mYUVFrame) == 0)
+                    {
+
+                        sws_scale(
+                            mSwsContext,
+                            (const uint8_t* const*)mYUVFrame->data,
+                            mYUVFrame->linesize,
+                            0,
+                            mCodecContext->height,
+                            mRGBFrame->data,
+                            mRGBFrame->linesize
+                        );
+
+                        VideoWidth  = mCodecContext->width;
+                        VideoHeight = mCodecContext->height;
+
+                        std::vector<uint8_t> temp {};
+                        temp.assign(mOutBuffer, mOutBuffer + mCodecContext->width * mCodecContext->height * 3);
+                        VideoPixels.emplace_back(std::move(temp));
+                    }
+                }
+            }
+
+            av_packet_unref(mPacket);
+        }
+    }
+
+    void Close()
+    {
+        if (avcodec_send_packet(mCodecContext, nullptr) == 0)
+        {
+            while (avcodec_receive_frame(mCodecContext, mYUVFrame) == 0)
+            {
+            }
+        }
+    }
+
+private:
+    void ReleaseResources() noexcept
+    {
+        av_free(mOutBuffer);
+        mOutBuffer = nullptr;
+
+        sws_freeContext(mSwsContext);
+        mSwsContext = nullptr;
+
+        avcodec_free_context(&mCodecContext);
+        avformat_close_input(&mFormatContext);
+        av_packet_free(&mPacket);
+        av_frame_free(&mYUVFrame);
+        av_frame_free(&mRGBFrame);
+    }
+};
+
+class OpenGL
+{
+    uint32_t mVAO {};
+    uint32_t mVBO {};
+    uint32_t mTexture {};
+    uint32_t mShaderProgram {};
+    GLFWwindow* mWindow {};
+
+public:
+    OpenGL()
+    {
+        glfwInit();
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    }
+
+    ~OpenGL()
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+
+        glDeleteVertexArrays(1, &mVAO);
+        glDeleteBuffers(1, &mVBO);
+        glDeleteProgram(mShaderProgram);
+
+        glfwDestroyWindow(mWindow);
+        glfwTerminate();
+    }
+
+    void Init()
+    {
+        mWindow = glfwCreateWindow(800, 600, "Video", NULL, NULL);
+        if (mWindow == NULL)
+        {
+            std::cout << "Failed to create GLFW window\n";
+        }
+
+        glfwMakeContextCurrent(mWindow);
+
+        if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+        {
+            std::cout << "Failed to initialize GLAD\n";
+        }
+
+        //---------------------------------------------------------------------------------
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // Enable Keyboard Controls
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;  // Enable Gamepad Controls
+        ImGui_ImplGlfw_InitForOpenGL(mWindow, true);
+        ImGui_ImplOpenGL3_Init("#version 330 core");
+        ImGui::StyleColorsDark();
+
+        //---------------------------------------------------------------------------------
+        unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vertexShader, 1, &VS, NULL);
+        glCompileShader(vertexShader);
+
+        int success {0};
+        char infoLog[512] {0};
+        glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+        if (!success)
+        {
+            glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+            std::cout << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << infoLog << std::endl;
+        }
+
+        unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fragmentShader, 1, &FS, NULL);
+        glCompileShader(fragmentShader);
+
+        glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+        if (!success)
+        {
+            glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
+            std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
+        }
+
+        mShaderProgram = glCreateProgram();
+        glAttachShader(mShaderProgram, vertexShader);
+        glAttachShader(mShaderProgram, fragmentShader);
+        glLinkProgram(mShaderProgram);
+
+        glGetProgramiv(mShaderProgram, GL_LINK_STATUS, &success);
+        if (!success)
+        {
+            glGetProgramInfoLog(mShaderProgram, 512, NULL, infoLog);
+            std::cout << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+        }
+        glDetachShader(mShaderProgram, vertexShader);
+        glDetachShader(mShaderProgram, fragmentShader);
+        glDeleteShader(vertexShader);
+        glDeleteShader(fragmentShader);
+
+        //---------------------------------------------------------------------------------
+        static float vertices[] = {-0.5f, 0.5f, 0.0f, 0.0f, -0.5f, -0.5f, 0.0f, 1.0f, 0.5f, 0.5f, 1.0f, 0.0f, 0.5f, -0.5f, 1.0f, 1.0f};
+
+        glGenVertexArrays(1, &mVAO);
+        glGenBuffers(1, &mVBO);
+
+        glBindVertexArray(mVAO);
+
+        glBindBuffer(GL_ARRAY_BUFFER, mVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+
+        //---------------------------------------------------------------------------------
+        glGenTextures(1, &mTexture);
+        glBindTexture(GL_TEXTURE_2D, mTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        int width {}, height {}, nrChannels {};
+        stbi_set_flip_vertically_on_load(true);
+        unsigned char* data = stbi_load("../resources/wood.png", &width, &height, &nrChannels, 0);
+        if (data)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        }
+        else
+        {
+            std::cout << "Failed to load texture" << std::endl;
+        }
+        stbi_image_free(data);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    void Draw()
+    {
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        //---------------------------------------------------------------------------------
+        ImGui::Begin("Play video");
+        {
+            static double lastTime {0.};
+
+            auto time = glfwGetTime();
+            auto fps  = static_cast<int>(1. / (time - lastTime));
+            lastTime  = time;
+
+            auto text = std::format("FPS: {}\nPixels: {}", fps, VideoPixels.size());
+
+            ImGui::Text(text.c_str());
+        }
+        ImGui::End();
+
+        //--------------------------------------------------
+        if (!VideoPixels.empty())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+
+            glBindTexture(GL_TEXTURE_2D, mTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, VideoWidth, VideoHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, VideoPixels.back().data());
+            glGenerateMipmap(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            VideoPixels.erase(--VideoPixels.cend());
+        }
+
+        //--------------------------------------------------
+
+        int display_w {}, display_h {};
+        glfwGetFramebufferSize(mWindow, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+
+        glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glUseProgram(mShaderProgram);
+        glBindTexture(GL_TEXTURE_2D, mTexture);
+        glBindVertexArray(mVAO);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
+
+    void Loop()
+    {
+        while (!glfwWindowShouldClose(mWindow))
+        {
+            glfwPollEvents();
+            Draw();
+            glfwSwapBuffers(mWindow);
+        }
+    }
+};
+
+int main()
+{
+    try
+    {
+        FFmpegReader reader {};
+        reader.Open();
+        reader.Read();
+        reader.Close();
+
+        OpenGL openGL {};
+        openGL.Init();
+        openGL.Loop();
+    }
+    catch (std::exception& e)
+    {
+        std::cerr << e.what() << std::endl;
+    }
+
+    return 0;
+}
+
+#endif // TEST10

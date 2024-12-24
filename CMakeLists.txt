@@ -29,7 +29,6 @@ else()
     message(FATAL_ERROR "---------------- not found FFMPEG")
 endif()
 
-
 set(bin_dir "${FFMPEG_ROOT}/bin")
 foreach(dll_name ${FFmpeg_required_componets})
     file(GLOB dll_files "${bin_dir}/${dll_name}-*.dll")
@@ -40,6 +39,10 @@ foreach(dll_name ${FFmpeg_required_componets})
     endforeach()
 endforeach()
 
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/glad)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/glfw)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/imgui)
+
 set(target_name "Test")
 
 add_executable(${target_name} main.cpp)
@@ -47,4 +50,11 @@ add_executable(${target_name} main.cpp)
 target_include_directories(${target_name} PRIVATE ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(${target_name} PRIVATE ${FFMPEG_LIBRARIES})
 
-target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external) # stb_image
+target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/stb_image)
+target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/include)
+target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/glad/include)
+target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/glfw/include)
+
+target_link_libraries(${target_name} PRIVATE glad)
+target_link_libraries(${target_name} PRIVATE imgui)
+target_link_libraries(${target_name} PRIVATE glfw)
